@@ -13,6 +13,24 @@
 #include "dashboard.h"
 #include "pin_config.h"
 
+#if defined(OBD2_CAPTURE_TWAI_ERRORS)
+#include "hal/twai_hal.h"
+
+static volatile uint32_t lastCanErrorCode = 0;
+
+extern "C" uint32_t __real_twai_hal_get_events(twai_hal_context_t *hal);
+
+extern "C" uint32_t IRAM_ATTR __wrap_twai_hal_get_events(twai_hal_context_t *hal)
+{
+    // The SDK consumes the error capture register while handling a bus error.
+    const uint32_t errorCode = hal->dev->error_code_capture_reg.val & 0xFFu;
+    const uint32_t events = __real_twai_hal_get_events(hal);
+    if (events & TWAI_HAL_EVENT_BUS_ERR)
+        lastCanErrorCode = errorCode;
+    return events;
+}
+#endif
+
 #if __has_include("wifi.local.h")
 #include "wifi.local.h"
 #endif
@@ -32,6 +50,9 @@ constexpr uint8_t kCoolant = 0x05;
 constexpr uint8_t kSupportedPids = 0x00;
 constexpr uint32_t kResponseTimeoutMs = 300;
 constexpr uint32_t kCooldownMs = 2000;
+constexpr uint32_t kCanFailureAlerts = TWAI_ALERT_BUS_OFF | TWAI_ALERT_TX_FAILED;
+constexpr uint32_t kCanAlerts = kCanFailureAlerts | TWAI_ALERT_TX_SUCCESS |
+                                TWAI_ALERT_ARB_LOST | TWAI_ALERT_BUS_ERROR;
 constexpr auto kCanTx = static_cast<gpio_num_t>(CAN_TX);
 constexpr auto kCanRx = static_cast<gpio_num_t>(CAN_RX);
 constexpr char kApSsid[] = "B85380";
@@ -347,9 +368,37 @@ static_assert(!validPayload(kTestRpm, 4, kRpm, 4) &&
               !validPayload(kTestNegative, sizeof(kTestNegative), kCoolant, 3),
               "reject malformed or unrelated frames");
 
+void logCanDiagnostics(uint32_t alerts)
+{
+#if defined(OBD2_CAPTURE_TWAI_ERRORS)
+    if (alerts & TWAI_ALERT_BUS_ERROR)
+        Serial.printf("CAN B: ecc=0x%02X\n", static_cast<unsigned>(lastCanErrorCode));
+#endif
+
+    Serial.printf("CAN B: tx_ok=%u arbitration_lost=%u bus_error=%u bus_off=%u\n",
+                  static_cast<unsigned>((alerts & TWAI_ALERT_TX_SUCCESS) != 0),
+                  static_cast<unsigned>((alerts & TWAI_ALERT_ARB_LOST) != 0),
+                  static_cast<unsigned>((alerts & TWAI_ALERT_BUS_ERROR) != 0),
+                  static_cast<unsigned>((alerts & TWAI_ALERT_BUS_OFF) != 0));
+
+    twai_status_info_t status = {};
+    if (twai_get_status_info(&status) == ESP_OK)
+    {
+        Serial.printf("CAN B counters: tx_error=%lu rx_error=%lu tx_failed=%lu arbitration_lost=%lu bus_errors=%lu\n",
+                      static_cast<unsigned long>(status.tx_error_counter),
+                      static_cast<unsigned long>(status.rx_error_counter),
+                      static_cast<unsigned long>(status.tx_failed_count),
+                      static_cast<unsigned long>(status.arb_lost_count),
+                      static_cast<unsigned long>(status.bus_error_count));
+    }
+}
+
 bool query(uint8_t pid, uint8_t responseLength, twai_message_t &reply)
 {
     twai_clear_receive_queue();
+    uint32_t alerts = 0;
+    // A successful query may have left its transmit-complete alert pending.
+    twai_read_alerts(&alerts, 0);
     twai_message_t request = {};
     request.identifier = kRequestId;
     request.data_length_code = 8;
@@ -361,17 +410,21 @@ bool query(uint8_t pid, uint8_t responseLength, twai_message_t &reply)
     if (tx != ESP_OK)
     {
         Serial.printf("PID %02X: cannot queue request (%s)\n", pid, esp_err_to_name(tx));
+        logCanDiagnostics(alerts & TWAI_ALERT_BUS_OFF);
         return false;
     }
 
     const uint32_t start = millis();
+    uint32_t queryAlerts = 0;
     while (millis() - start < kResponseTimeoutMs)
     {
-        uint32_t alerts = 0;
-        if (twai_read_alerts(&alerts, 0) == ESP_OK &&
-            (alerts & (TWAI_ALERT_BUS_OFF | TWAI_ALERT_TX_FAILED)))
+        alerts = 0;
+        twai_read_alerts(&alerts, 0);
+        queryAlerts |= alerts;
+        if (queryAlerts & kCanFailureAlerts)
         {
             Serial.printf("PID %02X: CAN transmission failed; no retry\n", pid);
+            logCanDiagnostics(queryAlerts);
             return false;
         }
         if (twai_receive(&reply, pdMS_TO_TICKS(10)) == ESP_OK &&
@@ -381,7 +434,14 @@ bool query(uint8_t pid, uint8_t responseLength, twai_message_t &reply)
             return true;
         }
     }
-    Serial.printf("PID %02X: no valid reply from 0x7E8; no retry\n", pid);
+    alerts = 0;
+    twai_read_alerts(&alerts, 0);
+    queryAlerts |= alerts;
+    if (queryAlerts & kCanFailureAlerts)
+        Serial.printf("PID %02X: CAN transmission failed; no retry\n", pid);
+    else
+        Serial.printf("PID %02X: no valid reply from 0x7E8; no retry\n", pid);
+    logCanDiagnostics(queryAlerts);
     return false;
 }
 
@@ -398,7 +458,7 @@ void readOnce()
     latest.attempted = true;
     twai_general_config_t config = TWAI_GENERAL_CONFIG_DEFAULT(kCanTx, kCanRx, TWAI_MODE_NORMAL);
     config.tx_queue_len = 0;
-    config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_TX_FAILED;
+    config.alerts_enabled = kCanAlerts;
     const twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
     // In single-filter mode, a standard CAN identifier occupies bits 31:21.
     const twai_filter_config_t filter = {kEngineReplyId << 21, ~(0x7FFu << 21), true};
