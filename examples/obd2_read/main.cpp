@@ -11,6 +11,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "dashboard.h"
+#include "dsg_response.h"
 #include "pin_config.h"
 #include "vw_firmware_version.h"
 
@@ -46,6 +47,11 @@ extern "C" uint32_t IRAM_ATTR __wrap_twai_hal_get_events(twai_hal_context_t *hal
 namespace {
 constexpr uint32_t kRequestId = 0x7DF;
 constexpr uint32_t kEngineReplyId = 0x7E8;
+// VW Passat B8 0GC diagnostic addressing, to be confirmed on the target car.
+constexpr uint32_t kDsgRequestId = 0x7E1;
+constexpr uint32_t kDsgReplyId = 0x7E9;
+constexpr uint16_t kDsgIdentityDids[] = {0xF187, 0xF189, 0xF19E};
+constexpr uint32_t kDsgResponseTimeoutMs = 1500;
 constexpr uint8_t kRpm = 0x0C;
 constexpr uint8_t kCoolant = 0x05;
 constexpr uint8_t kSupportedPids = 0x00;
@@ -96,6 +102,8 @@ struct Reading
 };
 
 Reading latest;
+bool hasRead = false;
+uint32_t lastRead = 0;
 uint32_t sampleNumber = 0;
 bool checkedSupportedPids = false;
 bool hasSupportedPids = false;
@@ -453,17 +461,23 @@ void keepCanBIdle()
     gpio_set_direction(kCanTx, GPIO_MODE_OUTPUT);
 }
 
+esp_err_t installCanB(uint32_t replyId, uint32_t rxQueueLength)
+{
+    twai_general_config_t config = TWAI_GENERAL_CONFIG_DEFAULT(kCanTx, kCanRx, TWAI_MODE_NORMAL);
+    config.tx_queue_len = 0;
+    config.rx_queue_len = rxQueueLength;
+    config.alerts_enabled = kCanAlerts;
+    const twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
+    // In single-filter mode, a standard CAN identifier occupies bits 31:21.
+    const twai_filter_config_t filter = {replyId << 21, ~(0x7FFu << 21), true};
+    return twai_driver_install(&config, &timing, &filter);
+}
+
 void readOnce()
 {
     latest = Reading{};
     latest.attempted = true;
-    twai_general_config_t config = TWAI_GENERAL_CONFIG_DEFAULT(kCanTx, kCanRx, TWAI_MODE_NORMAL);
-    config.tx_queue_len = 0;
-    config.alerts_enabled = kCanAlerts;
-    const twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
-    // In single-filter mode, a standard CAN identifier occupies bits 31:21.
-    const twai_filter_config_t filter = {kEngineReplyId << 21, ~(0x7FFu << 21), true};
-    if (twai_driver_install(&config, &timing, &filter) != ESP_OK)
+    if (installCanB(kEngineReplyId, 5) != ESP_OK)
     {
         Serial.println("CAN B: driver installation failed");
         return;
@@ -516,18 +530,131 @@ void readOnce()
     keepCanBIdle();
 }
 
+esp_err_t sendDsgFrame(uint8_t first, uint8_t second, uint8_t third, uint8_t fourth = 0)
+{
+    twai_message_t message = {};
+    message.identifier = kDsgRequestId;
+    message.data_length_code = 8;
+    message.ss = 1;
+    message.data[0] = first;
+    message.data[1] = second;
+    message.data[2] = third;
+    message.data[3] = fourth;
+    return twai_transmit(&message, 0);
+}
+
+const char *queryDsgIdentity(uint16_t did, DsgResponse &response)
+{
+    twai_clear_receive_queue();
+    uint32_t alerts = 0;
+    twai_read_alerts(&alerts, 0);
+    if ((alerts & TWAI_ALERT_BUS_OFF) || sendDsgFrame(3, 0x22, did >> 8, did & 0xFF) != ESP_OK)
+        return "CAN_ERROR";
+
+    const uint32_t start = millis();
+    while (millis() - start < kDsgResponseTimeoutMs)
+    {
+        twai_message_t reply = {};
+        const auto rx = twai_receive(&reply, pdMS_TO_TICKS(10));
+        alerts = 0;
+        twai_read_alerts(&alerts, 0);
+        if (alerts & kCanFailureAlerts)
+        {
+            logCanDiagnostics(alerts);
+            return "CAN_ERROR";
+        }
+        if (rx != ESP_OK || reply.extd || reply.rtr || reply.identifier != kDsgReplyId)
+            continue;
+
+        switch (response.accept(did, reply.data, reply.data_length_code))
+        {
+        case DsgResponse::Result::Complete:
+            return nullptr;
+        case DsgResponse::Result::Negative:
+            return "NRC";
+        case DsgResponse::Result::Invalid:
+            return "INVALID_FRAME";
+        case DsgResponse::Result::FlowControl:
+            // The bounded response fits in one ISO-TP block.
+            if (sendDsgFrame(0x30, 0, 0) != ESP_OK)
+                return "CAN_ERROR";
+            break;
+        default:
+            break;
+        }
+    }
+    return "TIMEOUT";
+}
+
+void readDsgIdentity()
+{
+    if (hasRead && millis() - lastRead < kCooldownMs)
+    {
+        Serial.println("DSG ERROR COOLDOWN");
+        return;
+    }
+    if (installCanB(kDsgReplyId, 24) != ESP_OK)
+    {
+        Serial.println("DSG ERROR CAN_INSTALL");
+        return;
+    }
+
+    const bool started = twai_start() == ESP_OK;
+    if (started)
+    {
+        for (uint16_t did : kDsgIdentityDids)
+        {
+            DsgResponse response;
+            const char *error = queryDsgIdentity(did, response);
+            if (!error)
+            {
+                char hex[(DsgResponse::capacity - 3) * 2 + 1] = {};
+                constexpr char digits[] = "0123456789ABCDEF";
+                for (size_t index = 3; index < response.length; ++index)
+                {
+                    const size_t offset = (index - 3) * 2;
+                    hex[offset] = digits[response.payload[index] >> 4];
+                    hex[offset + 1] = digits[response.payload[index] & 0x0F];
+                }
+                Serial.printf("DSG %04X OK %s\n", did, hex);
+            }
+            else if (std::strcmp(error, "NRC") == 0)
+            {
+                Serial.printf("DSG %04X NRC %02X\n", did, response.nrc);
+                if (did == kDsgIdentityDids[0])
+                    break;
+            }
+            else
+            {
+                Serial.printf("DSG %04X %s\n", did, error);
+                break;
+            }
+        }
+        twai_stop();
+    }
+
+    const bool removed = twai_driver_uninstall() == ESP_OK;
+    keepCanBIdle();
+    lastRead = millis();
+    hasRead = true;
+    if (!removed)
+        Serial.println("DSG ERROR CAN_CLEANUP");
+    else if (!started)
+        Serial.println("DSG ERROR CAN_START");
+    else
+        Serial.println("DSG END");
+}
+
 bool triggerRead()
 {
-    static bool hasRun = false;
-    static uint32_t lastRead = 0;
-    if (hasRun && millis() - lastRead < kCooldownMs)
+    if (hasRead && millis() - lastRead < kCooldownMs)
         return false;
 
     readOnce();
     ++sampleNumber;
     logReading(latest);
     lastRead = millis();
-    hasRun = true;
+    hasRead = true;
     return true;
 }
 
@@ -551,6 +678,12 @@ void handleReadRequest()
     }
     sendReading();
 }
+
+void printReaderVersion()
+{
+    Serial.println(VW_FIRMWARE_ID);
+    Serial.println("READER CAPABILITIES dsg-id");
+}
 } // namespace
 
 void setup()
@@ -560,7 +693,7 @@ void setup()
     digitalWrite(MCP2515_RST, LOW);
     Serial.begin(115200);
     Serial.println("OBD-II READ ONLY | CAN B 500 kbit/s | idle | type read + Enter");
-    Serial.println(VW_FIRMWARE_ID);
+    printReaderVersion();
     dashboardReady = startDashboard();
     const auto bootHigh = static_cast<unsigned>(esp_random());
     const auto bootLow = static_cast<unsigned>(esp_random());
@@ -586,10 +719,15 @@ void loop()
                 if (!triggerRead())
                     Serial.println("Wait 2 seconds before another read");
             }
-            else if (!overflow && length == sizeof(command) &&
+            else if (!overflow && length == sizeof("version") - 1 &&
                      std::memcmp(command, "version", length) == 0)
             {
-                Serial.println(VW_FIRMWARE_ID);
+                printReaderVersion();
+            }
+            else if (!overflow && length == sizeof("dsg-id") - 1 &&
+                     std::memcmp(command, "dsg-id", length) == 0)
+            {
+                readDsgIdentity();
             }
             else if (length || overflow)
             {

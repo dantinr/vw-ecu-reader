@@ -34,10 +34,13 @@ internal sealed class Dashboard : Form
     private readonly Dictionary<int, MetricWindow> metricWindows = new();
     private readonly Queue<Sample> history = new();
     private readonly Telemetry telemetry = new();
+    private readonly Button readDsg = ActionButton("读取 TCU 信息", primary: true);
+    private readonly DsgPanel dsgPanel;
     private readonly SampleStore sampleStore;
     private readonly Timer timer = new() { Interval = 40 };
     private SerialPort? port;
     private bool isReader;
+    private bool supportsDsg;
     private bool polling;
     private long probeAt;
     private long probeDeadline;
@@ -49,6 +52,7 @@ internal sealed class Dashboard : Form
     public Dashboard(SampleStore sampleStore)
     {
         this.sampleStore = sampleStore;
+        dsgPanel = new DsgPanel(readDsg);
         Text = "VW ECU Reader";
         Font = new Font("Microsoft YaHei UI", 9f);
         BackColor = Palette.Background;
@@ -65,6 +69,7 @@ internal sealed class Dashboard : Form
         connect.Click += (_, _) => { if (port is null) OpenPort(); else ClosePort(); };
         ports.SelectedIndexChanged += (_, _) => UpdateActions();
         read.Click += (_, _) => RequestRead(Environment.TickCount64);
+        readDsg.Click += (_, _) => RequestDsgIdentity();
         poll.Click += (_, _) => TogglePolling();
         save.Click += (_, _) => SaveLog();
         save.Enabled = false;
@@ -170,7 +175,13 @@ internal sealed class Dashboard : Form
         var lower = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 72));
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
-        lower.Controls.Add(metricGrid, 0, 0);
+        var tabs = new TabControl { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 8, 0) };
+        var engine = new TabPage("发动机") { BackColor = Palette.Background, Padding = new Padding(0, 6, 0, 0) };
+        var transmission = new TabPage("变速箱") { BackColor = Palette.White };
+        engine.Controls.Add(metricGrid);
+        transmission.Controls.Add(dsgPanel);
+        tabs.TabPages.AddRange([engine, transmission]);
+        lower.Controls.Add(tabs, 0, 0);
         var logTitle = new Label { Text = "串口日志", AutoSize = true, ForeColor = Palette.Ink, Font = Palette.Section };
         lower.Controls.Add(PanelWithHeading(logTitle, log, save, new Padding(8, 0, 0, 0)), 1, 0);
         layout.Controls.Add(lower, 0, 2);
@@ -260,6 +271,8 @@ internal sealed class Dashboard : Form
 
         port = candidate;
         isReader = false;
+        supportsDsg = false;
+        dsgPanel.Reset();
         telemetry.Reset();
         history.Clear();
         ShowValues();
@@ -281,6 +294,8 @@ internal sealed class Dashboard : Form
         catch (IOException) { }
         polling = false;
         isReader = false;
+        supportsDsg = false;
+        dsgPanel.Reset();
         telemetry.Reset();
         ShowValues();
         AppendLog(reason ?? "串口已断开");
@@ -297,6 +312,8 @@ internal sealed class Dashboard : Form
         {
             telemetry.Feed(port.ReadExisting(), now);
             telemetry.Advance(now);
+            if (dsgPanel.Advance(now))
+                readyAt = now + 2100;
             if (!isReader && probeAt != 0 && now >= probeAt)
             {
                 probeAt = 0;
@@ -307,7 +324,7 @@ internal sealed class Dashboard : Form
                 probeDeadline = 0;
                 SetActivity("未识别到 OBD-II 只读固件。请检查串口和板子固件。", isError: true);
             }
-            if (polling && !telemetry.Pending && now >= nextPoll && now >= readyAt)
+            if (polling && now >= nextPoll)
                 RequestRead(now);
             UpdateActions();
         }
@@ -324,7 +341,9 @@ internal sealed class Dashboard : Form
         {
             // A board reset invalidates the current request and pauses periodic reads.
             isReader = false;
+            supportsDsg = false;
             polling = false;
+            dsgPanel.Reset();
             telemetry.Reset();
             long now = Environment.TickCount64;
             probeAt = now + 350;
@@ -338,11 +357,15 @@ internal sealed class Dashboard : Form
             probeAt = probeDeadline = 0;
             SetActivity("只读固件已就绪。");
         }
+        if (line == DsgPanel.Capability)
+            supportsDsg = true;
+        if (dsgPanel.AcceptLine(line))
+            readyAt = Environment.TickCount64 + 2100;
     }
 
     private void RequestRead(long now)
     {
-        if (port is null || !isReader || telemetry.Pending || now < readyAt)
+        if (port is null || !isReader || telemetry.Pending || dsgPanel.Pending || now < readyAt)
             return;
         try { port.Write("read\n"); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or TimeoutException)
@@ -353,6 +376,22 @@ internal sealed class Dashboard : Form
         telemetry.Begin(now);
         AppendLog("> read");
         SetActivity("正在读取车辆数据…");
+        UpdateActions();
+    }
+
+    private void RequestDsgIdentity()
+    {
+        if (!readDsg.Enabled || port is null)
+            return;
+        try { port.Write("dsg-id\n"); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or TimeoutException)
+        {
+            ClosePort("TCU 识别指令发送失败  " + error.Message);
+            return;
+        }
+
+        dsgPanel.Begin(Environment.TickCount64);
+        AppendLog("> dsg-id");
         UpdateActions();
     }
 
@@ -518,11 +557,17 @@ internal sealed class Dashboard : Form
     private void UpdateActions()
     {
         bool attached = port is not null;
+        bool mayRead = isReader && !telemetry.Pending && !dsgPanel.Pending && Environment.TickCount64 >= readyAt;
         ports.Enabled = refresh.Enabled = !attached;
         connect.Enabled = attached || ports.SelectedIndex >= 0;
         connect.Text = attached ? "断开" : "连接";
-        read.Enabled = isReader && !polling && !telemetry.Pending && Environment.TickCount64 >= readyAt;
-        poll.Enabled = isReader;
+        read.Enabled = mayRead && !polling;
+        poll.Enabled = isReader && !dsgPanel.Pending;
+        string dsgStatus = !isReader ? "连接板子后可识别 TCU。"
+            : !supportsDsg ? "请刷入支持 TCU 识别的固件。"
+            : polling ? "暂停连续读取后可识别 TCU。"
+            : "等待读取 TCU 信息。";
+        dsgPanel.UpdateAvailability(mayRead && supportsDsg && !polling, dsgStatus);
         poll.Text = polling ? "暂停连续读取" : "开启连续读取";
         connection.Text = !attached ? "未连接" : $"{port!.PortName}  /  115200  ·  {(isReader ? "已连接" : "串口已打开")}";
         connection.ForeColor = isReader ? Palette.Green : Palette.Muted;
