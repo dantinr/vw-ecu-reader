@@ -3,33 +3,25 @@ using System.Globalization;
 
 namespace VwEcuReader;
 
-internal static class Palette
-{
-    public static readonly Color Background = Color.FromArgb(239, 244, 250);
-    public static readonly Color White = Color.White;
-    public static readonly Color Ink = Color.FromArgb(22, 41, 66);
-    public static readonly Color Muted = Color.FromArgb(84, 104, 128);
-    public static readonly Color Border = Color.FromArgb(214, 225, 239);
-    public static readonly Color Blue = Color.FromArgb(30, 99, 202);
-    public static readonly Color Green = Color.FromArgb(0, 117, 93);
-    public static readonly Color Error = Color.FromArgb(165, 62, 33);
-    public static readonly Font Title = new("Segoe UI", 24f, FontStyle.Bold);
-    public static readonly Font Section = new("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
-    public static readonly Font MetricValue = new("Segoe UI Semibold", 20f);
-}
-
 internal sealed class TrendChart : Control
 {
     private const int Rows = 4;
+    private ReaderTheme theme = ReaderTheme.Classic;
     private int metricIndex;
     private Sample[] samples = [];
 
     public TrendChart()
     {
-        BackColor = Palette.White;
         AccessibleName = "读数趋势";
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                  ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+
+    public void ApplyTheme(ReaderTheme value)
+    {
+        theme = value;
+        BackColor = theme.Plot;
+        Invalidate();
     }
 
     public void SetData(int selectedMetric, Sample[] history)
@@ -58,8 +50,10 @@ internal sealed class TrendChart : Control
         double step = NiceStep((max - min + 2 * padding) / 3);
         double bottom = Math.Floor((min - padding) / step) * step;
 
-        using var grid = new Pen(Palette.Border);
-        using var labels = new SolidBrush(Palette.Muted);
+        using var grid = new Pen(theme.Border);
+        if (theme.Mode == ThemeMode.Wrc)
+            grid.DashStyle = DashStyle.Dash;
+        using var labels = new SolidBrush(theme.Muted);
         using var axisFont = new Font("Segoe UI", 8.5f);
         using var right = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
         for (int row = 0; row <= Rows; row++)
@@ -87,7 +81,7 @@ internal sealed class TrendChart : Control
         graphics.DrawString(end.ToString("HH:mm:ss"), axisFont, labels,
             new PointF(plot.Right, plot.Bottom + 16 * scale), right);
 
-        Color color = Metric.All[metricIndex].Color;
+        Color color = theme.Traces[metricIndex];
         using var trend = new Pen(color, 2.4f * scale);
         using var dot = new SolidBrush(color);
         PointF? previous = null;

@@ -4,16 +4,16 @@ using System.Text.RegularExpressions;
 
 namespace VwEcuReader;
 
-internal sealed record Metric(string Key, string Label, string Unit, string Format, Color Color)
+internal sealed record Metric(string Key, string Label, string Unit, string Format)
 {
     public static readonly Metric[] All =
     [
-        new("rpm", "发动机转速", "rpm", "0.##", Color.FromArgb(26, 101, 211)),
-        new("coolant", "冷却液温度", "°C", "0", Color.FromArgb(203, 77, 33)),
-        new("speed", "车速", "km/h", "0", Color.FromArgb(0, 126, 124)),
-        new("load", "发动机负荷", "%", "0.0", Color.FromArgb(123, 84, 186)),
-        new("throttle", "节气门开度", "%", "0.0", Color.FromArgb(158, 94, 25)),
-        new("intake", "进气温度", "°C", "0", Color.FromArgb(20, 121, 168)),
+        new("rpm", "发动机转速", "rpm", "0.##"),
+        new("coolant", "冷却液温度", "°C", "0"),
+        new("speed", "车速", "km/h", "0"),
+        new("load", "发动机负荷", "%", "0.0"),
+        new("throttle", "节气门开度", "%", "0.0"),
+        new("intake", "进气温度", "°C", "0"),
     ];
 }
 

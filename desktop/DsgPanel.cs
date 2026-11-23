@@ -16,9 +16,10 @@ internal sealed class DsgPanel : UserControl
     private readonly TextBox[] values = new TextBox[Fields.Length];
     private readonly Label status = new()
     {
-        AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Palette.Muted,
+        AutoSize = true, Anchor = AnchorStyles.Left,
         Margin = new Padding(0, 8, 0, 0),
     };
+    private ReaderTheme theme = ReaderTheme.Classic;
     private long deadline;
     private int received;
     private string? result;
@@ -30,7 +31,6 @@ internal sealed class DsgPanel : UserControl
     {
         this.readButton = readButton;
         Dock = DockStyle.Fill;
-        BackColor = Palette.White;
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 6,
@@ -51,8 +51,8 @@ internal sealed class DsgPanel : UserControl
             };
             var value = new TextBox
             {
-                AccessibleName = Fields[index].Label, ReadOnly = true, Text = "—",
-                Anchor = AnchorStyles.Left | AnchorStyles.Right, BackColor = Palette.Background,
+                AccessibleName = Fields[index].Label, ReadOnly = true, Text = "—", BorderStyle = BorderStyle.FixedSingle,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
                 Font = new Font("Consolas", 10f),
             };
             values[index] = value;
@@ -68,11 +68,25 @@ internal sealed class DsgPanel : UserControl
         Controls.Add(layout);
     }
 
+    public void ApplyTheme(ReaderTheme value)
+    {
+        theme = value;
+        BackColor = theme.Surface;
+        ForeColor = theme.Text;
+        theme.StyleButton(readButton, primary: true);
+        foreach (var field in values)
+        {
+            field.BackColor = theme.Background;
+            field.ForeColor = theme.Text;
+        }
+        status.ForeColor = failed ? theme.Error : theme.Muted;
+    }
+
     public void UpdateAvailability(bool ready, string idleStatus)
     {
         readButton.Enabled = ready && !Pending;
         status.Text = Pending ? "正在识别变速箱控制器…" : result ?? idleStatus;
-        status.ForeColor = failed ? Palette.Error : Palette.Muted;
+        status.ForeColor = failed ? theme.Error : theme.Muted;
     }
 
     public void Reset()

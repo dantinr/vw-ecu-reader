@@ -5,10 +5,9 @@ namespace VwEcuReader;
 internal sealed class MetricView : UserControl
 {
     private readonly int metricIndex;
-    private readonly Label reading = new()
-    {
-        AutoSize = true, ForeColor = Palette.Ink, Font = Palette.MetricValue, Text = "—", Margin = Padding.Empty,
-    };
+    private readonly Label reading = new() { AutoSize = true, Text = "—", Margin = Padding.Empty };
+    private readonly Label unit;
+    private readonly Button? popOut;
     private readonly TrendChart chart = new() { Dock = DockStyle.Fill, Margin = Padding.Empty };
 
     public MetricView(int metricIndex, Action? openWindow = null)
@@ -16,7 +15,6 @@ internal sealed class MetricView : UserControl
         this.metricIndex = metricIndex;
         var metric = Metric.All[metricIndex];
         Dock = DockStyle.Fill;
-        BackColor = Palette.White;
         AccessibleName = metric.Label;
         chart.AccessibleName = metric.Label + "趋势";
 
@@ -34,26 +32,25 @@ internal sealed class MetricView : UserControl
         var heading = new Label
         {
             Text = metric.Label, AutoSize = true, Anchor = AnchorStyles.Left,
-            Margin = Padding.Empty, ForeColor = Palette.Ink, Font = Palette.Section,
+            Margin = Padding.Empty, Font = ReaderTheme.SectionFont,
         };
         layout.Controls.Add(heading, 0, 0);
         if (openWindow is not null)
         {
-            var popOut = new Button
+            popOut = new Button
             {
                 Text = "独立窗口", AccessibleName = $"在独立窗口查看{metric.Label}",
                 Anchor = AnchorStyles.Right, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                FlatStyle = FlatStyle.Flat, BackColor = Palette.White, ForeColor = Palette.Blue,
+                FlatStyle = FlatStyle.Flat,
                 Margin = new Padding(2, 0, 0, 0), UseVisualStyleBackColor = false,
             };
-            popOut.FlatAppearance.BorderColor = Palette.Border;
             popOut.Click += (_, _) => openWindow();
             layout.Controls.Add(popOut, 1, 0);
         }
 
-        var unit = new Label
+        unit = new Label
         {
-            Text = metric.Unit, AutoSize = true, ForeColor = Palette.Muted, Margin = new Padding(5, 13, 0, 0),
+            Text = metric.Unit, AutoSize = true, Margin = new Padding(5, 13, 0, 0),
         };
         var readingRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
         readingRow.Controls.AddRange([reading, unit]);
@@ -62,6 +59,22 @@ internal sealed class MetricView : UserControl
         layout.Controls.Add(chart, 0, 2);
         layout.SetColumnSpan(chart, 2);
         Controls.Add(layout);
+    }
+
+    public void ApplyTheme(ReaderTheme theme)
+    {
+        BackColor = theme.Surface;
+        ForeColor = theme.Text;
+        bool classic = theme.Mode == ThemeMode.Classic;
+        reading.Font = classic ? ReaderTheme.ReadingFont : ReaderTheme.RacingReadingFont;
+        reading.ForeColor = classic ? theme.Text : theme.Traces[metricIndex];
+        unit.ForeColor = theme.Muted;
+        if (popOut is not null)
+        {
+            theme.StyleButton(popOut);
+            popOut.ForeColor = theme.Accent;
+        }
+        chart.ApplyTheme(theme);
     }
 
     public void ShowValue(double? value) =>
@@ -78,8 +91,6 @@ internal sealed class MetricWindow : Form
     {
         Text = Metric.All[metricIndex].Label + " | VW ECU Reader";
         Font = font;
-        ForeColor = Palette.Ink;
-        BackColor = Palette.Background;
         AutoScaleMode = AutoScaleMode.Dpi;
         Padding = new Padding(12);
         StartPosition = FormStartPosition.Manual;
@@ -87,5 +98,12 @@ internal sealed class MetricWindow : Form
         MinimumSize = new Size(300, 250);
         View = new MetricView(metricIndex);
         Controls.Add(View);
+    }
+
+    public void ApplyTheme(ReaderTheme theme)
+    {
+        BackColor = theme.Background;
+        ForeColor = theme.Text;
+        View.ApplyTheme(theme);
     }
 }

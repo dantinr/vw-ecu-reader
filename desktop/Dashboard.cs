@@ -8,33 +8,54 @@ namespace VwEcuReader;
 internal sealed class Dashboard : Form
 {
     private const int PollIntervalMs = 3000;
-    private readonly ComboBox ports = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 91 };
+    private readonly ReaderComboBox ports = new() { Width = 91, AccessibleName = "串口" };
     private readonly Button refresh = ActionButton("刷新端口");
-    private readonly Button connect = ActionButton("连接", primary: true);
+    private readonly Button connect = ActionButton("连接");
     private readonly Button read = ActionButton("读取一次");
     private readonly Button poll = ActionButton("开启连续读取");
     private readonly Button save = ActionButton("保存日志");
-    private readonly Label connection = new() { AutoSize = true, ForeColor = Palette.Muted };
+    private readonly Label connection = new() { AutoSize = true };
     private readonly Label activity = new() { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
-    private readonly ComboBox storage = new()
+    private readonly ReaderHeader header = new() { Dock = DockStyle.Fill, Margin = Padding.Empty };
+    private readonly Label subtitle = new()
     {
-        DropDownStyle = ComboBoxStyle.DropDownList, Width = 93, AccessibleName = "存储方式",
+        Dock = DockStyle.Top, Height = 24, Text = "OBD-II  实时仪表盘", BackColor = Color.Transparent,
+    };
+    private readonly ReaderComboBox themeSelector = new()
+    {
+        Width = 90, AccessibleName = "主题",
+    };
+    private readonly FlowLayoutPanel actions = new()
+    {
+        Dock = DockStyle.Fill, Padding = new Padding(12, 4, 8, 4),
+        Margin = new Padding(0, 0, 0, 8), WrapContents = false,
+    };
+    private readonly ReaderTabs tabs = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 8, 0) };
+    private readonly TabPage engine = new("发动机") { Padding = new Padding(0, 6, 0, 0) };
+    private readonly TabPage transmission = new("变速箱");
+    private readonly TableLayoutPanel logPanel = new()
+    {
+        Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2,
+        Padding = new Padding(14, 8, 14, 10), Margin = new Padding(8, 0, 0, 0),
+    };
+    private readonly ReaderComboBox storage = new()
+    {
+        Width = 93, AccessibleName = "存储方式",
     };
     private readonly Label databaseStatus = new()
     {
-        AutoSize = true, Anchor = AnchorStyles.Right, ForeColor = Palette.Muted, Text = "SQLite · 等待读取",
+        AutoSize = true, Anchor = AnchorStyles.Right, Text = "SQLite · 等待读取",
     };
     private readonly RichTextBox log = new()
     {
         Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.None,
-        BackColor = Palette.White, ForeColor = Palette.Muted,
         Font = new Font("Consolas", 9.25f), WordWrap = false, DetectUrls = false, TabStop = false,
     };
     private readonly MetricView[] metrics = new MetricView[Metric.All.Length];
     private readonly Dictionary<int, MetricWindow> metricWindows = new();
     private readonly Queue<Sample> history = new();
     private readonly Telemetry telemetry = new();
-    private readonly Button readDsg = ActionButton("读取 TCU 信息", primary: true);
+    private readonly Button readDsg = ActionButton("读取 TCU 信息");
     private readonly DsgPanel dsgPanel;
     private readonly SampleStore sampleStore;
     private readonly Timer timer = new() { Interval = 40 };
@@ -47,6 +68,10 @@ internal sealed class Dashboard : Form
     private long readyAt;
     private long nextPoll;
     private bool closing;
+    private bool activityError;
+    private StatusTone storageTone;
+    private ReaderTheme theme = ReaderTheme.Classic;
+    private string ThemePath => Path.Combine(Path.GetDirectoryName(sampleStore.DatabasePath)!, "theme.txt");
     private StorageBackend SelectedBackend => (StorageBackend)storage.SelectedItem!;
 
     public Dashboard(SampleStore sampleStore)
@@ -55,15 +80,16 @@ internal sealed class Dashboard : Form
         dsgPanel = new DsgPanel(readDsg);
         Text = "VW ECU Reader";
         Font = new Font("Microsoft YaHei UI", 9f);
-        BackColor = Palette.Background;
-        ForeColor = Palette.Ink;
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(980, 660);
         ClientSize = new Size(1150, 730);
         storage.Items.AddRange([StorageBackend.SQLite, StorageBackend.Memurai]);
         storage.SelectedItem = StorageBackend.SQLite;
+        themeSelector.Items.AddRange(ReaderTheme.All);
         Controls.Add(BuildLayout());
+        LoadTheme();
+        themeSelector.SelectedIndexChanged += (_, _) => ChangeTheme();
 
         refresh.Click += (_, _) => RefreshPorts();
         connect.Click += (_, _) => { if (port is null) OpenPort(); else ClosePort(); };
@@ -113,7 +139,7 @@ internal sealed class Dashboard : Form
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill, Padding = new Padding(24, 16, 24, 14),
-            ColumnCount = 1, RowCount = 4, BackColor = Palette.Background,
+            ColumnCount = 1, RowCount = 4,
         };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 76));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 57));
@@ -123,23 +149,20 @@ internal sealed class Dashboard : Form
         var title = new Label
         {
             Dock = DockStyle.Top, Height = 43, Text = "VW ECU Reader",
-            Font = Palette.Title, ForeColor = Palette.Ink,
+            Font = ReaderTheme.TitleFont, BackColor = Color.Transparent,
         };
-        var subtitle = new Label
+        var themeControls = new FlowLayoutPanel
         {
-            Dock = DockStyle.Top, Height = 24, Text = "OBD-II  实时仪表盘",
-            ForeColor = Palette.Muted,
+            Dock = DockStyle.Right, Width = 142, BackColor = Color.Transparent,
+            Padding = new Padding(4, 16, 0, 0), WrapContents = false,
         };
-        var header = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty };
+        themeControls.Controls.Add(new Label { Text = "主题", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
+        themeControls.Controls.Add(themeSelector);
         header.Controls.Add(subtitle);
         header.Controls.Add(title);
+        header.Controls.Add(themeControls);
         layout.Controls.Add(header, 0, 0);
 
-        var actions = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill, BackColor = Palette.White, Padding = new Padding(12, 4, 8, 4),
-            Margin = new Padding(0, 0, 0, 8), WrapContents = false,
-        };
         actions.Controls.Add(new Label { Text = "串口", AutoSize = true, Margin = new Padding(1, 10, 9, 0) });
         ports.Margin = new Padding(0, 7, 8, 0);
         actions.Controls.Add(ports);
@@ -175,15 +198,23 @@ internal sealed class Dashboard : Form
         var lower = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 72));
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
-        var tabs = new TabControl { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 8, 0) };
-        var engine = new TabPage("发动机") { BackColor = Palette.Background, Padding = new Padding(0, 6, 0, 0) };
-        var transmission = new TabPage("变速箱") { BackColor = Palette.White };
         engine.Controls.Add(metricGrid);
         transmission.Controls.Add(dsgPanel);
         tabs.TabPages.AddRange([engine, transmission]);
         lower.Controls.Add(tabs, 0, 0);
-        var logTitle = new Label { Text = "串口日志", AutoSize = true, ForeColor = Palette.Ink, Font = Palette.Section };
-        lower.Controls.Add(PanelWithHeading(logTitle, log, save, new Padding(8, 0, 0, 0)), 1, 0);
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        logPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        logPanel.Controls.Add(new Label
+        {
+            Text = "串口日志", AutoSize = true, Anchor = AnchorStyles.Left, Font = ReaderTheme.SectionFont,
+        }, 0, 0);
+        save.Anchor = AnchorStyles.Right;
+        logPanel.Controls.Add(save, 1, 0);
+        logPanel.Controls.Add(log, 0, 1);
+        logPanel.SetColumnSpan(log, 2);
+        lower.Controls.Add(logPanel, 1, 0);
         layout.Controls.Add(lower, 0, 2);
 
         var footer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
@@ -197,43 +228,74 @@ internal sealed class Dashboard : Form
         return layout;
     }
 
-    private static Control PanelWithHeading(Label heading, Control content, Button? action, Padding margin)
+    private void LoadTheme()
     {
-        var panel = new TableLayoutPanel
+        try
         {
-            Dock = DockStyle.Fill, BackColor = Palette.White, ColumnCount = 2, RowCount = 2,
-            Padding = new Padding(14, 8, 14, 10), Margin = margin,
-        };
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        heading.Anchor = AnchorStyles.Left;
-        panel.Controls.Add(heading, 0, 0);
-        if (action is not null)
-        {
-            action.Anchor = AnchorStyles.Right;
-            panel.Controls.Add(action, 1, 0);
+            if (File.Exists(ThemePath))
+            {
+                string name = File.ReadAllText(ThemePath).Trim();
+                theme = ReaderTheme.All.FirstOrDefault(option => option.Mode.ToString() == name) ?? ReaderTheme.Classic;
+            }
         }
-        panel.Controls.Add(content, 0, 1);
-        panel.SetColumnSpan(content, 2);
-        return panel;
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            AppendLog("读取主题设置失败  " + error.Message);
+        }
+        themeSelector.SelectedItem = theme;
+        ApplyTheme();
     }
 
-    private static Button ActionButton(string text, bool primary = false)
+    private void ChangeTheme()
     {
-        var button = new Button
+        if (themeSelector.SelectedItem is not ReaderTheme selected)
+            return;
+        theme = selected;
+        ApplyTheme();
+        try
         {
-            Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            MinimumSize = new Size(64, 32), Padding = new Padding(8, 0, 8, 0),
-            Margin = new Padding(0, 3, 8, 0), FlatStyle = FlatStyle.Flat,
-            BackColor = primary ? Palette.Blue : Palette.White,
-            ForeColor = primary ? Palette.White : Palette.Ink,
-            UseVisualStyleBackColor = false,
-        };
-        button.FlatAppearance.BorderColor = primary ? Palette.Blue : Palette.Border;
-        return button;
+            Directory.CreateDirectory(Path.GetDirectoryName(ThemePath)!);
+            File.WriteAllText(ThemePath, theme.Mode.ToString());
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            AppendLog("保存主题设置失败  " + error.Message);
+        }
     }
+
+    private void ApplyTheme()
+    {
+        BackColor = theme.Background;
+        ForeColor = theme.Text;
+        header.ApplyTheme(theme);
+        subtitle.ForeColor = theme.Muted;
+        actions.BackColor = theme.Surface;
+        engine.BackColor = theme.Background;
+        transmission.BackColor = theme.Surface;
+        tabs.ApplyTheme(theme);
+        logPanel.BackColor = log.BackColor = theme.Surface;
+        log.ForeColor = theme.Muted;
+        foreach (var selector in new[] { ports, storage, themeSelector })
+            selector.ApplyTheme(theme);
+        foreach (var button in new[] { refresh, read, poll, save })
+            theme.StyleButton(button);
+        theme.StyleButton(connect, primary: true);
+        foreach (var metric in metrics)
+            metric.ApplyTheme(theme);
+        foreach (var window in metricWindows.Values)
+            window.ApplyTheme(theme);
+        dsgPanel.ApplyTheme(theme);
+        activity.ForeColor = activityError ? theme.Error : theme.Muted;
+        databaseStatus.ForeColor = theme.StatusColor(storageTone);
+        connection.ForeColor = isReader ? theme.Success : theme.Muted;
+    }
+
+    private static Button ActionButton(string text) => new ReaderButton
+    {
+        Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        MinimumSize = new Size(64, 32), Padding = new Padding(8, 0, 8, 0),
+        Margin = new Padding(0, 3, 8, 0), FlatStyle = FlatStyle.Flat, UseVisualStyleBackColor = false,
+    };
 
     private void RefreshPorts()
     {
@@ -440,19 +502,19 @@ internal sealed class Dashboard : Form
     {
         if (backend == StorageBackend.SQLite)
         {
-            ShowStorageStatus(backend, "等待读取", Palette.Muted);
+            ShowStorageStatus(backend, "等待读取");
             return;
         }
 
-        ShowStorageStatus(backend, "正在连接", Palette.Muted);
+        ShowStorageStatus(backend, "正在连接");
         try
         {
             await sampleStore.CheckMemuraiAsync();
-            ShowStorageStatus(backend, "已连接", Palette.Green);
+            ShowStorageStatus(backend, "已连接", StatusTone.Success);
         }
         catch (Exception error) when (IsStorageError(error))
         {
-            ShowStorageStatus(backend, "连接失败", Palette.Error);
+            ShowStorageStatus(backend, "连接失败", StatusTone.Error);
             AppendLog($"Memurai 连接失败 ({SampleStore.MemuraiAddress})  {error.Message}");
         }
     }
@@ -462,24 +524,25 @@ internal sealed class Dashboard : Form
         StorageBackend backend = SelectedBackend;
         try
         {
-            ShowStorageStatus(backend, "正在保存", Palette.Muted);
+            ShowStorageStatus(backend, "正在保存");
             await sampleStore.AppendAsync(sample, portName, backend);
-            ShowStorageStatus(backend, "已保存", Palette.Green);
+            ShowStorageStatus(backend, "已保存", StatusTone.Success);
         }
         catch (Exception error) when (IsStorageError(error))
         {
-            ShowStorageStatus(backend, "保存失败", Palette.Error);
+            ShowStorageStatus(backend, "保存失败", StatusTone.Error);
             string target = backend == StorageBackend.Memurai ? SampleStore.MemuraiAddress : sampleStore.DatabasePath;
             AppendLog($"{backend} 保存失败 ({target})  {error.Message}");
         }
     }
 
-    private void ShowStorageStatus(StorageBackend backend, string status, Color color)
+    private void ShowStorageStatus(StorageBackend backend, string status, StatusTone tone = StatusTone.Neutral)
     {
         if (SelectedBackend != backend)
             return;
         databaseStatus.Text = $"{backend} · {status}";
-        databaseStatus.ForeColor = color;
+        storageTone = tone;
+        databaseStatus.ForeColor = theme.StatusColor(tone);
     }
 
     private static bool IsStorageError(Exception error) =>
@@ -531,6 +594,7 @@ internal sealed class Dashboard : Form
         }
 
         var window = new MetricWindow(index, Font);
+        window.ApplyTheme(theme);
         var workArea = Screen.FromControl(this).WorkingArea;
         int offset = 22 * metricWindows.Count;
         window.Location = new Point(
@@ -570,13 +634,14 @@ internal sealed class Dashboard : Form
         dsgPanel.UpdateAvailability(mayRead && supportsDsg && !polling, dsgStatus);
         poll.Text = polling ? "暂停连续读取" : "开启连续读取";
         connection.Text = !attached ? "未连接" : $"{port!.PortName}  /  115200  ·  {(isReader ? "已连接" : "串口已打开")}";
-        connection.ForeColor = isReader ? Palette.Green : Palette.Muted;
+        connection.ForeColor = isReader ? theme.Success : theme.Muted;
     }
 
     private void SetActivity(string text, bool isError = false)
     {
+        activityError = isError;
         activity.Text = text;
-        activity.ForeColor = isError ? Palette.Error : Palette.Muted;
+        activity.ForeColor = isError ? theme.Error : theme.Muted;
     }
 
     private void AppendLog(string line)
