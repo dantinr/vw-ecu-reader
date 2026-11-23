@@ -3,6 +3,7 @@
 #include "driver/twai.h"
 #include "pin_config.h"
 #include "mcp2515.h"
+#include "vw_firmware_version.h"
 
 static MCP2515 Can_A(MCP2515_CS, 10000000, &SPI);
 
@@ -20,6 +21,7 @@ void setup() {
     Serial.begin(115200);
     delay(2500);
     Serial.println("\n=== CAN B (TWAI) self-test : NO_ACK + self reception ===");
+    Serial.println(VW_FIRMWARE_ID);
     Serial.printf("TX pin=%d  RX pin=%d  bitrate=500k\n", CAN_TX, CAN_RX);
 
     // Silence CAN A so it cannot influence the bus.
@@ -70,6 +72,10 @@ void setup() {
 }
 
 void loop() {
+    const int command = Serial.read();
+    if (command == 'v' || command == 'V')
+        Serial.println(VW_FIRMWARE_ID);
+
     static uint32_t round = 0, tx = 0, txerr = 0, rx = 0;
     twai_message_t m = {};
     m.identifier = 0x123;

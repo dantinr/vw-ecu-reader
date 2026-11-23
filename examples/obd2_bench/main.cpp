@@ -3,6 +3,7 @@
 #include "driver/twai.h"
 #include "mcp2515.h"
 #include "pin_config.h"
+#include "vw_firmware_version.h"
 
 #if !defined(T_2Can) || defined(T_2Can_Fd)
 #error "obd2_bench requires T-2CAN v1.0 (MCP2515)"
@@ -144,7 +145,8 @@ void setup()
     digitalWrite(MCP2515_RST, LOW);
     SPI.begin(MCP2515_SCLK, MCP2515_MISO, MCP2515_MOSI, MCP2515_CS);
     Serial.begin(115200);
-    Serial.println("OBD-II BENCH ONLY, DO NOT CONNECT TO VEHICLE. Press t to test.");
+    Serial.println("OBD-II BENCH ONLY, DO NOT CONNECT TO VEHICLE. Press t to test or v for version.");
+    Serial.println(VW_FIRMWARE_ID);
 }
 
 void loop()
@@ -152,5 +154,7 @@ void loop()
     const int command = Serial.read();
     if (command == 't' || command == 'T')
         runBenchTest();
+    else if (command == 'v' || command == 'V')
+        Serial.println(VW_FIRMWARE_ID);
     delay(10);
 }

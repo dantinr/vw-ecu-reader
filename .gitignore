@@ -1,3 +1,6 @@
 .pio
 .vscode
 /examples/obd2_read/wifi.local.h
+/desktop/bin/
+/desktop/obj/
+/desktop/out/

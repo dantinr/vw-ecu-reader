@@ -69,4 +69,4 @@ PLATFORMIO_BUILD_DIR=.pio/self-test-build PLATFORMIO_SRC_DIR=debug/examples/self
 
 ## 后续排错记录
 
-后续在本页按日期追加。每轮保留车辆和硬件状态、测试动作、串口结果、改动和恢复情况，以及还需要验证的问题。
+后续在本页按日期追加。每轮保留固件版本、车辆和硬件状态、测试动作、串口结果、改动和恢复情况，以及还需要验证的问题。

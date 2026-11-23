@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "dashboard.h"
 #include "pin_config.h"
+#include "vw_firmware_version.h"
 
 #if defined(OBD2_CAPTURE_TWAI_ERRORS)
 #include "hal/twai_hal.h"
@@ -559,6 +560,7 @@ void setup()
     digitalWrite(MCP2515_RST, LOW);
     Serial.begin(115200);
     Serial.println("OBD-II READ ONLY | CAN B 500 kbit/s | idle | type read + Enter");
+    Serial.println(VW_FIRMWARE_ID);
     dashboardReady = startDashboard();
     const auto bootHigh = static_cast<unsigned>(esp_random());
     const auto bootLow = static_cast<unsigned>(esp_random());
@@ -568,7 +570,7 @@ void setup()
 
 void loop()
 {
-    static char command[5] = {};
+    static char command[sizeof("version") - 1] = {};
     static size_t length = 0;
     static bool overflow = false;
 
@@ -584,14 +586,19 @@ void loop()
                 if (!triggerRead())
                     Serial.println("Wait 2 seconds before another read");
             }
+            else if (!overflow && length == sizeof(command) &&
+                     std::memcmp(command, "version", length) == 0)
+            {
+                Serial.println(VW_FIRMWARE_ID);
+            }
             else if (length || overflow)
             {
-                Serial.println("Only 'read' is supported");
+                Serial.println("Commands: 'read', 'version'");
             }
             length = 0;
             overflow = false;
         }
-        else if (length < sizeof(command) - 1)
+        else if (length < sizeof(command))
         {
             command[length++] = static_cast<char>(ch);
         }

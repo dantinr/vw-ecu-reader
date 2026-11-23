@@ -52,7 +52,26 @@ pio run -c platformio-obd2-read.ini -j 1 -t upload --upload-port COM3
 pio device monitor --port COM3 --baud 115200 --echo
 ```
 
-`OBD-II READ ONLY | CAN B 500 kbit/s | idle` 表示实车版已启动。如果打开监视器时错过启动信息，**在未接车时**输入 `?` 回车，看到 `Only 'read' is supported` 可验证串口通信，不会发 CAN 帧。
+`OBD-II READ ONLY | CAN B 500 kbit/s | idle` 表示实车版已启动。实车版、诊断版、台架版和单板自检版每次通过 PlatformIO 构建或刷写时，都会把带 UTC 构建时间的版本号写进固件，并在启动时通过串口显示版本号、构建环境和 Git 提交号。Git 有本地改动时显示 `+dirty`。实车版和诊断版可在 `115200` 串口输入 `version` 并回车查询，台架版和单板自检版按 `v` 查询。版本查询不会触发 CAN 请求。用旧的 `.bin` 恢复时，恢复的是该文件原有的版本。
+
+## Windows 串口仪表盘
+
+用 USB 接板子，打开 `VW ECU Reader` 桌面程序，选择 `COM3` 或实际的串口并点击「连接」。串口一次只能由一个程序使用，连接前关闭 PlatformIO 串口监视器。
+
+连接后可以接收板子已有的读数。点击「读取一次」会发一条 `read` 指令。也可以开启连续读取，每轮结束后约 3 秒再读一次，遇到发送失败、回包超时等读取错误会暂停。主界面同时显示六项读数和各自的趋势。点击任一指标的「独立窗口」，可以单独查看并调整窗口大小。右侧可保存串口日志。仪表盘兼容原版只读固件及带版本号的只读版和诊断版。
+
+仪表盘每读完一轮就自动保存读数和失败原因。顶部「存储」可在 SQLite 和 Memurai 之间切换，窗口下方显示连接和保存状态。切换后，新完成的读取写入所选存储。
+
+- SQLite 是默认选项，数据库位于 `%LOCALAPPDATA%\VwEcuReader\readings.sqlite3`。首次写入时创建数据库，按采样时间建立索引。
+- Memurai 连接本机 `127.0.0.1:6379`，读数写入 `vw-ecu-reader:readings` Stream。重启后能恢复到哪个时间点，取决于 Memurai 的快照或 AOF 持久化设置。
+
+板载 CSV 用于脱离电脑时记录数据。
+
+从源码运行需要 Windows 和 .NET 10 SDK，在仓库根目录执行：
+
+```powershell
+dotnet run --project desktop/VwEcuReader.csproj
+```
 
 ## 首次接车与读取
 
