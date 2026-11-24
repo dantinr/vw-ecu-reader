@@ -32,6 +32,7 @@ internal sealed class Telemetry
     private long lastSampleLine;
 
     public bool Pending => values is not null;
+    public Func<string, bool>? ConsumeLine { get; set; }
     public event Action<string>? LineReceived;
     public event Action? ValuesChanged;
     public event Action<Sample>? Completed;
@@ -96,7 +97,7 @@ internal sealed class Telemetry
 
     private void AcceptLine(string line, long now)
     {
-        if (line.Length == 0)
+        if (line.Length == 0 || ConsumeLine?.Invoke(line) == true)
             return;
         LineReceived?.Invoke(line);
 

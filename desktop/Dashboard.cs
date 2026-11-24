@@ -5,7 +5,7 @@ using Timer = System.Windows.Forms.Timer;
 
 namespace VwEcuReader;
 
-internal sealed class Dashboard : Form
+internal sealed partial class Dashboard : Form
 {
     private const int PollIntervalMs = 3000;
     private readonly ReaderComboBox ports = new() { Width = 91, AccessibleName = "串口" };
@@ -78,6 +78,7 @@ internal sealed class Dashboard : Form
     {
         this.sampleStore = sampleStore;
         dsgPanel = new DsgPanel(readDsg);
+        capturePanel = new CanCapturePanel(captureButton, CapturePath);
         Text = "VW ECU Reader";
         Font = new Font("Microsoft YaHei UI", 9f);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -92,7 +93,8 @@ internal sealed class Dashboard : Form
         themeSelector.SelectedIndexChanged += (_, _) => ChangeTheme();
 
         refresh.Click += (_, _) => RefreshPorts();
-        connect.Click += (_, _) => { if (port is null) OpenPort(); else ClosePort(); };
+        connect.Click += (_, _) => { if (port is null) OpenPort(); else Disconnect(); };
+        captureButton.Click += (_, _) => ToggleCapture();
         ports.SelectedIndexChanged += (_, _) => UpdateActions();
         read.Click += (_, _) => RequestRead(Environment.TickCount64);
         readDsg.Click += (_, _) => RequestDsgIdentity();
@@ -115,6 +117,7 @@ internal sealed class Dashboard : Form
         };
         Shown += (_, _) => _ = ShowStorageReadyAsync(SelectedBackend);
         telemetry.LineReceived += OnSerialLine;
+        telemetry.ConsumeLine = ConsumeCaptureLine;
         telemetry.ValuesChanged += ShowValues;
         telemetry.Completed += OnSample;
         timer.Tick += (_, _) => Tick();
@@ -200,7 +203,8 @@ internal sealed class Dashboard : Form
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
         engine.Controls.Add(metricGrid);
         transmission.Controls.Add(dsgPanel);
-        tabs.TabPages.AddRange([engine, transmission]);
+        canFrames.Controls.Add(capturePanel);
+        tabs.TabPages.AddRange([engine, transmission, canFrames]);
         lower.Controls.Add(tabs, 0, 0);
         logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -272,6 +276,7 @@ internal sealed class Dashboard : Form
         actions.BackColor = theme.Surface;
         engine.BackColor = theme.Background;
         transmission.BackColor = theme.Surface;
+        canFrames.BackColor = theme.Surface;
         tabs.ApplyTheme(theme);
         logPanel.BackColor = log.BackColor = theme.Surface;
         log.ForeColor = theme.Muted;
@@ -285,6 +290,7 @@ internal sealed class Dashboard : Form
         foreach (var window in metricWindows.Values)
             window.ApplyTheme(theme);
         dsgPanel.ApplyTheme(theme);
+        capturePanel.ApplyTheme(theme);
         activity.ForeColor = activityError ? theme.Error : theme.Muted;
         databaseStatus.ForeColor = theme.StatusColor(storageTone);
         connection.ForeColor = isReader ? theme.Success : theme.Muted;
@@ -321,6 +327,7 @@ internal sealed class Dashboard : Form
         var candidate = new SerialPort(name, 115200)
         {
             DtrEnable = true, RtsEnable = false, Handshake = Handshake.None, WriteTimeout = 250,
+            ReadBufferSize = 256 * 1024,
         };
         try { candidate.Open(); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
@@ -332,8 +339,12 @@ internal sealed class Dashboard : Form
         }
 
         port = candidate;
+        capture = null;
+        nextCaptureDisplay = 0;
         isReader = false;
         supportsDsg = false;
+        supportsCapture = false;
+        firmwareIdentity = null;
         dsgPanel.Reset();
         telemetry.Reset();
         history.Clear();
@@ -350,6 +361,8 @@ internal sealed class Dashboard : Form
 
     private void ClosePort(string? reason = null)
     {
+        capture?.Interrupt(reason is null ? "DISCONNECTED" : "SERIAL_ERROR");
+        disconnectAfterCapture = false;
         var closing = port;
         port = null;
         try { closing?.Dispose(); }
@@ -357,6 +370,8 @@ internal sealed class Dashboard : Form
         polling = false;
         isReader = false;
         supportsDsg = false;
+        supportsCapture = false;
+        firmwareIdentity = null;
         dsgPanel.Reset();
         telemetry.Reset();
         ShowValues();
@@ -367,9 +382,13 @@ internal sealed class Dashboard : Form
 
     private void Tick()
     {
-        if (port is null)
-            return;
         long now = Environment.TickCount64;
+        if (port is null)
+        {
+            AdvanceCapture(now);
+            UpdateActions();
+            return;
+        }
         try
         {
             telemetry.Feed(port.ReadExisting(), now);
@@ -388,6 +407,7 @@ internal sealed class Dashboard : Form
             }
             if (polling && now >= nextPoll)
                 RequestRead(now);
+            AdvanceCapture(now);
             UpdateActions();
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or TimeoutException)
@@ -404,6 +424,9 @@ internal sealed class Dashboard : Form
             // A board reset invalidates the current request and pauses periodic reads.
             isReader = false;
             supportsDsg = false;
+            supportsCapture = false;
+            firmwareIdentity = null;
+            capture?.Interrupt("BOARD_RESET");
             polling = false;
             dsgPanel.Reset();
             telemetry.Reset();
@@ -421,13 +444,17 @@ internal sealed class Dashboard : Form
         }
         if (line == DsgPanel.Capability)
             supportsDsg = true;
+        if (line == CanCapture.Capability)
+            supportsCapture = true;
+        if (line.StartsWith("VW ECU Reader firmware:", StringComparison.Ordinal))
+            firmwareIdentity = line;
         if (dsgPanel.AcceptLine(line))
             readyAt = Environment.TickCount64 + 2100;
     }
 
     private void RequestRead(long now)
     {
-        if (port is null || !isReader || telemetry.Pending || dsgPanel.Pending || now < readyAt)
+        if (port is null || !isReader || CaptureBusy || telemetry.Pending || dsgPanel.Pending || now < readyAt)
             return;
         try { port.Write("read\n"); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or TimeoutException)
@@ -556,13 +583,16 @@ internal sealed class Dashboard : Form
             return;
         }
         Task pending = sampleStore.Completion;
-        if (pending.IsCompleted)
+        if (pending.IsCompleted && !CaptureBusy)
             return;
         args.Cancel = true;
         closing = true;
-        timer.Stop();
         Enabled = false;
-        try { await pending; }
+        if (CaptureBusy)
+            SendCaptureCommand(capture!.Stop(Environment.TickCount64));
+        else
+            timer.Stop();
+        try { await Task.WhenAll(pending, capture?.Completion ?? Task.CompletedTask); }
         catch (Exception error) when (IsStorageError(error))
         {
             // The pending operation reports its own error.
@@ -621,17 +651,19 @@ internal sealed class Dashboard : Form
     private void UpdateActions()
     {
         bool attached = port is not null;
-        bool mayRead = isReader && !telemetry.Pending && !dsgPanel.Pending && Environment.TickCount64 >= readyAt;
+        bool mayRead = isReader && !CaptureBusy && !telemetry.Pending && !dsgPanel.Pending && Environment.TickCount64 >= readyAt;
         ports.Enabled = refresh.Enabled = !attached;
-        connect.Enabled = attached || ports.SelectedIndex >= 0;
+        connect.Enabled = !disconnectAfterCapture && (attached || (!CaptureBusy && ports.SelectedIndex >= 0));
         connect.Text = attached ? "断开" : "连接";
         read.Enabled = mayRead && !polling;
-        poll.Enabled = isReader && !dsgPanel.Pending;
+        poll.Enabled = isReader && !CaptureBusy && !dsgPanel.Pending;
         string dsgStatus = !isReader ? "连接板子后可识别 TCU。"
             : !supportsDsg ? "请刷入支持 TCU 识别的固件。"
+            : CaptureBusy ? "请先停止 CAN 帧采集。"
             : polling ? "暂停连续读取后可识别 TCU。"
             : "等待读取 TCU 信息。";
         dsgPanel.UpdateAvailability(mayRead && supportsDsg && !polling, dsgStatus);
+        capturePanel.UpdateAction(CanStartCapture, capture);
         poll.Text = polling ? "暂停连续读取" : "开启连续读取";
         connection.Text = !attached ? "未连接" : $"{port!.PortName}  /  115200  ·  {(isReader ? "已连接" : "串口已打开")}";
         connection.ForeColor = isReader ? theme.Success : theme.Muted;

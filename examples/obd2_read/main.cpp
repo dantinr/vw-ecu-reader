@@ -10,6 +10,7 @@
 #include "esp_partition.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "can_capture.h"
 #include "dashboard.h"
 #include "dsg_response.h"
 #include "pin_config.h"
@@ -60,6 +61,7 @@ constexpr uint32_t kCooldownMs = 2000;
 constexpr uint32_t kCanFailureAlerts = TWAI_ALERT_BUS_OFF | TWAI_ALERT_TX_FAILED;
 constexpr uint32_t kCanAlerts = kCanFailureAlerts | TWAI_ALERT_TX_SUCCESS |
                                 TWAI_ALERT_ARB_LOST | TWAI_ALERT_BUS_ERROR;
+constexpr twai_timing_config_t kCanTiming500k = TWAI_TIMING_CONFIG_500KBITS();
 constexpr auto kCanTx = static_cast<gpio_num_t>(CAN_TX);
 constexpr auto kCanRx = static_cast<gpio_num_t>(CAN_RX);
 constexpr char kApSsid[] = "B85380";
@@ -102,6 +104,7 @@ struct Reading
 };
 
 Reading latest;
+CanCapture capture;
 bool hasRead = false;
 uint32_t lastRead = 0;
 uint32_t sampleNumber = 0;
@@ -454,24 +457,116 @@ bool query(uint8_t pid, uint8_t responseLength, twai_message_t &reply)
     return false;
 }
 
-void keepCanBIdle()
+#if defined(OBD2_CAPTURE_TWAI_ERRORS)
+void listenCanB()
 {
-    gpio_reset_pin(kCanTx);
-    gpio_set_level(kCanTx, 1);
-    gpio_set_direction(kCanTx, GPIO_MODE_OUTPUT);
-}
+    constexpr uint32_t durationMs = 3000;
+    twai_general_config_t config = TWAI_GENERAL_CONFIG_DEFAULT(kCanTx, kCanRx, TWAI_MODE_LISTEN_ONLY);
+    config.tx_queue_len = 0;
+    config.rx_queue_len = 32;
+    const twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    const esp_err_t installed = twai_driver_install(&config, &kCanTiming500k, &filter);
+    if (installed != ESP_OK)
+    {
+        Serial.printf("CAN B LISTEN ERROR install=%s\n", esp_err_to_name(installed));
+        return;
+    }
 
-esp_err_t installCanB(uint32_t replyId, uint32_t rxQueueLength)
+    uint32_t frames = 0;
+    twai_status_info_t status = {};
+    const esp_err_t started = twai_start();
+    esp_err_t statusResult = ESP_OK;
+    if (started == ESP_OK)
+    {
+        const uint32_t start = millis();
+        twai_message_t frame = {};
+        while (millis() - start < durationMs)
+        {
+            if (twai_receive(&frame, pdMS_TO_TICKS(20)) == ESP_OK)
+                ++frames;
+        }
+        statusResult = twai_get_status_info(&status);
+        twai_stop();
+    }
+    const esp_err_t removed = twai_driver_uninstall();
+    keepCanBIdle();
+
+    if (removed != ESP_OK)
+        Serial.printf("CAN B LISTEN ERROR cleanup=%s\n", esp_err_to_name(removed));
+    else if (started != ESP_OK)
+        Serial.printf("CAN B LISTEN ERROR start=%s\n", esp_err_to_name(started));
+    else if (statusResult != ESP_OK)
+        Serial.printf("CAN B LISTEN ERROR status=%s\n", esp_err_to_name(statusResult));
+    else
+        Serial.printf("CAN B LISTEN 500 kbit/s %lu ms: frames=%lu rx_missed=%lu rx_overrun=%lu bus_errors=%lu\n",
+                      static_cast<unsigned long>(durationMs), static_cast<unsigned long>(frames),
+                      static_cast<unsigned long>(status.rx_missed_count),
+                      static_cast<unsigned long>(status.rx_overrun_count),
+                      static_cast<unsigned long>(status.bus_error_count));
+}
+#endif
+
+esp_err_t installCanB(uint32_t replyId, uint32_t rxQueueLength,
+                      const twai_timing_config_t &timing = kCanTiming500k)
 {
     twai_general_config_t config = TWAI_GENERAL_CONFIG_DEFAULT(kCanTx, kCanRx, TWAI_MODE_NORMAL);
     config.tx_queue_len = 0;
     config.rx_queue_len = rxQueueLength;
     config.alerts_enabled = kCanAlerts;
-    const twai_timing_config_t timing = TWAI_TIMING_CONFIG_500KBITS();
     // In single-filter mode, a standard CAN identifier occupies bits 31:21.
     const twai_filter_config_t filter = {replyId << 21, ~(0x7FFu << 21), true};
     return twai_driver_install(&config, &timing, &filter);
 }
+
+#if defined(OBD2_CAPTURE_TWAI_ERRORS)
+void probeRpm(bool laterSamplePoint)
+{
+    if (hasRead && millis() - lastRead < kCooldownMs)
+    {
+        Serial.println("CAN B RPM PROBE COOLDOWN");
+        return;
+    }
+
+    auto timing = kCanTiming500k;
+    if (laterSamplePoint)
+    {
+        // Move one quantum to segment 1 while retaining 20 quanta per bit.
+        ++timing.tseg_1;
+        --timing.tseg_2;
+    }
+    const unsigned samplePoint = 100u * (1u + timing.tseg_1) / (1u + timing.tseg_1 + timing.tseg_2);
+    Serial.printf("CAN B RPM PROBE 500 kbit/s sample_point=%u%%\n", samplePoint);
+
+    const esp_err_t installed = installCanB(kEngineReplyId, 5, timing);
+    if (installed != ESP_OK)
+    {
+        Serial.printf("CAN B RPM PROBE ERROR install=%s\n", esp_err_to_name(installed));
+        return;
+    }
+
+    twai_message_t reply = {};
+    const esp_err_t started = twai_start();
+    bool received = false;
+    if (started == ESP_OK)
+    {
+        received = query(kRpm, 4, reply);
+        twai_stop();
+    }
+    const esp_err_t removed = twai_driver_uninstall();
+    keepCanBIdle();
+    lastRead = millis();
+    hasRead = true;
+
+    if (removed != ESP_OK)
+        Serial.printf("CAN B RPM PROBE ERROR cleanup=%s\n", esp_err_to_name(removed));
+    else if (started != ESP_OK)
+        Serial.printf("CAN B RPM PROBE ERROR start=%s\n", esp_err_to_name(started));
+    else if (received)
+        Serial.printf("CAN B RPM PROBE OK rpm=%.2f\n", rpm(reply.data));
+    else
+        Serial.println("CAN B RPM PROBE FAILED");
+}
+#endif
 
 void readOnce()
 {
@@ -683,6 +778,7 @@ void printReaderVersion()
 {
     Serial.println(VW_FIRMWARE_ID);
     Serial.println("READER CAPABILITIES dsg-id");
+    Serial.println("READER CAPABILITIES can-capture-v1");
 }
 } // namespace
 
@@ -691,6 +787,7 @@ void setup()
     keepCanBIdle();
     pinMode(MCP2515_RST, OUTPUT);
     digitalWrite(MCP2515_RST, LOW);
+    Serial.setTxBufferSize(16 * 1024);
     Serial.begin(115200);
     Serial.println("OBD-II READ ONLY | CAN B 500 kbit/s | idle | type read + Enter");
     printReaderVersion();
@@ -703,35 +800,60 @@ void setup()
 
 void loop()
 {
-    static char command[sizeof("version") - 1] = {};
+    static char command[sizeof("canopen 00000000") - 1] = {};
     static size_t length = 0;
     static bool overflow = false;
 
-    if (dashboardReady)
+    if (dashboardReady && !capture.active())
         server.handleClient();
     while (Serial.available() > 0)
     {
         const int ch = Serial.read();
         if (ch == '\r' || ch == '\n')
         {
-            if (!overflow && length == 4 && std::memcmp(command, "read", 4) == 0)
+            if (!overflow && capture.handleCommand(command, length))
             {
-                if (!triggerRead())
-                    Serial.println("Wait 2 seconds before another read");
+                // Capture commands have their own acknowledgements.
             }
             else if (!overflow && length == sizeof("version") - 1 &&
                      std::memcmp(command, "version", length) == 0)
             {
                 printReaderVersion();
             }
+            else if (capture.active())
+            {
+                if (length || overflow)
+                    Serial.println("CAN B: passive capture in progress");
+            }
+            else if (!overflow && length == 4 && std::memcmp(command, "read", 4) == 0)
+            {
+                if (!triggerRead())
+                    Serial.println("Wait 2 seconds before another read");
+            }
             else if (!overflow && length == sizeof("dsg-id") - 1 &&
                      std::memcmp(command, "dsg-id", length) == 0)
             {
                 readDsgIdentity();
             }
+#if defined(OBD2_CAPTURE_TWAI_ERRORS)
+            else if (!overflow && length == sizeof("listen") - 1 &&
+                     std::memcmp(command, "listen", length) == 0)
+            {
+                listenCanB();
+            }
+            else if (!overflow && length == 5 && std::memcmp(command, "rpm8", 4) == 0 &&
+                     (command[4] == '0' || command[4] == '5'))
+            {
+                probeRpm(command[4] == '5');
+            }
+#endif
             else if (length || overflow)
             {
-                Serial.println("Commands: 'read', 'version'");
+#if defined(OBD2_CAPTURE_TWAI_ERRORS)
+                Serial.println("Commands: 'read', 'version', 'dsg-id', 'listen', 'rpm80', 'rpm85', 'canopen <8 hex digits>'");
+#else
+                Serial.println("Commands: 'read', 'version', 'dsg-id', 'canopen <8 hex digits>'");
+#endif
             }
             length = 0;
             overflow = false;
@@ -745,5 +867,6 @@ void loop()
             overflow = true;
         }
     }
-    delay(10);
+    capture.service();
+    delay(capture.active() ? 1 : 10);
 }

@@ -15,6 +15,12 @@ dotnet build desktop/VwEcuReader.csproj
 dotnet run --project desktop/VwEcuReader.csproj
 ```
 
+交付 Windows 桌面端最新版时，发布为自包含的单文件，固定覆盖 `desktop/out/win-x64/VwEcuReader.exe`。如果该路径下的 Reader 正在运行，关闭后再发布。
+
+```powershell
+dotnet publish desktop/VwEcuReader.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=embedded -o desktop/out/win-x64
+```
+
 按改动范围编译对应的 PlatformIO 环境。
 
 ```sh

@@ -98,6 +98,14 @@ pio device monitor --port COM3 --baud 115200 --echo
 
 固件在 CAN B 上向 `0x7E1` 发出只读查询，等待 `0x7E9` 响应，这组地址仍需在目标车辆上确认。需要排查时，用「保存日志」导出实际响应。当前页面提供 TCU 身份字段，油温、实际挡位和 K1/K2 滑差仍待核对对应的软件版本和测量定义。
 
+### 采集 CAN 原始帧
+
+使用支持 `can-capture-v1` 的固件连接 Reader，暂停连续读取，在「CAN 帧」页点「开始采集」。CAN B 以 500 kbit/s 只听模式接收 OBD 口上可见的标准帧、扩展帧和远程帧。采集期间暂停发动机、TCU 和板载网页查询。
+
+此页显示每秒收到的帧数、本次接收与保存总数、板端丢帧、FIFO 溢出、电脑缺帧、总线错误，以及最近 20 帧。停止时 Reader 会等板端发送剩余帧，然后写完数据库。串口中断时保留已经入库的数据，界面会提示采集中断。
+
+每次采集单独编号。Reader 将成功解析的原始帧写入 `%LOCALAPPDATA%\VwEcuReader\can-frames.sqlite3` 的 `can_frames` 表。页面底部可复制路径。每行包含采集编号、帧序号、板端从上电开始计的微秒时间、CAN ID、帧格式、DLC 和原始数据。采集结果和丢帧计数保存在 `can_capture_sessions` 表。
+
 ### 数据保存
 
 - **SQLite** 是默认选项。首次保存时创建 `%LOCALAPPDATA%\VwEcuReader\readings.sqlite3`，并按采样时间建立索引。
